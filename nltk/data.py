@@ -32,12 +32,16 @@ adds it to a resource cache; and ``retrieve()`` copies a given resource
 to a local file.
 """
 
+import atexit
 import codecs
 import functools
 import os
 import pickle
 import re
+import shutil
+import stat
 import sys
+import tempfile
 import textwrap
 import urllib.request
 import zipfile
@@ -51,6 +55,7 @@ from urllib.request import url2pathname
 from nltk.pathsec import ZipFile
 from nltk.pathsec import open as _secure_open
 from nltk.pathsec import urlopen as _secure_urlopen
+from nltk.pathsec import validate_path as _validate_path
 
 # Reject unsafe no-protocol paths: traversal segments, trailing '..', absolute paths,
 # backslashes, Windows drive letters. Use a raw-string pattern and do not anchor only
@@ -173,6 +178,132 @@ else:
 ######################################################################
 # Util Functions
 ######################################################################
+
+
+_STAGING_TEMPDIR = None
+
+
+def staging_tempdir():
+    """A process-wide scratch directory INSIDE an allowed data root.
+
+    ``tempfile.mkstemp()`` and ``NamedTemporaryFile()`` default to the system
+    temp dir, which on Linux is the shared, world-writable ``/tmp`` and is
+    deliberately NOT a pathsec root. Wrappers that stage an input file for an
+    external tool therefore wrote outside the sandbox. Pass this as ``dir=`` so
+    the scratch file lands inside a root instead.
+
+    Allocated once per process and removed at exit, so callers do not leak a
+    directory per invocation the way a per-call ``make_staging_dir`` would.
+    """
+    global _STAGING_TEMPDIR
+    if _STAGING_TEMPDIR is not None and not _staging_dir_is_still_safe(
+        _STAGING_TEMPDIR
+    ):
+        _STAGING_TEMPDIR = None
+    if _STAGING_TEMPDIR is None:
+        staged = make_staging_dir(prefix="nltk_scratch_")
+        atexit.register(shutil.rmtree, staged, ignore_errors=True)
+        _STAGING_TEMPDIR = staged
+    return _STAGING_TEMPDIR
+
+
+def _staging_dir_is_still_safe(path):
+    """Re-check a cached scratch directory before handing it out again.
+
+    The cache is a module global, so it is only as trustworthy as the directory
+    it names. ``os.path.isdir`` FOLLOWS symlinks, so an attacker who removes the
+    directory and drops a symlink in its place passes that check and every later
+    scratch file lands wherever the link points. ``lstat`` is used instead, and
+    containment is re-verified, so a swapped or poisoned value is discarded and
+    a fresh directory allocated.
+    """
+    from nltk import pathsec
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    # Not stat(): a symlink must be rejected, not followed.
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    try:
+        pathsec.validate_path(path, context="nltk.data.staging_tempdir")
+    except (PermissionError, ValueError):
+        return False
+    # A scratch dir that has become group- or world-writable is squattable:
+    # another local user can replace a file between the moment this process
+    # creates it and the moment it reads it back (CWE-377/CWE-378). Discard it
+    # and allocate a fresh 0700 one rather than reusing it.
+    if not pathsec.is_private_dir(path):
+        return False
+    return True
+
+
+def make_staging_dir(prefix="nltk_", cleanup=False):
+    """Create a fresh private directory for NLTK's own output, inside a data root.
+
+    NLTK's save helpers default here so their output lands within the security
+    sandbox (every ``nltk.data.path`` entry is an allowed root) on all platforms,
+    including Linux where the shared ``/tmp`` is deliberately not a root. The
+    directory is created with ``tempfile.mkdtemp`` (mode 0700, unpredictable name)
+    under the first ``nltk.data.path`` entry that can be written to.
+
+    :param prefix: filename prefix for the created directory. It is a *name*
+        fragment, not a path: callers build it from values such as a tagger's
+        language code, and ``tempfile.mkdtemp`` simply concatenates it onto
+        *dir*, so a ``..`` inside it would place the directory outside the data
+        root (CWE-22). Path separators and NUL are therefore refused.
+    :type prefix: str
+    :param cleanup: remove the directory when the interpreter exits. Use it for
+        scratch output nobody will look for again; leave it False for a saved
+        model, where deleting the user's artifact would be surprising.
+    :return: the absolute path of the created directory.
+    :rtype: str
+    :raises ValueError: if *prefix* is not a plain filename fragment.
+    :raises PermissionError: if no ``nltk.data.path`` entry is a writable allowed
+        root, in which case the caller should pass an explicit destination.
+    """
+    prefix = str(prefix)
+    if (
+        "\x00" in prefix
+        or "/" in prefix
+        or "\\" in prefix
+        or os.sep in prefix
+        or (os.altsep and os.altsep in prefix)
+    ):
+        raise ValueError(
+            f"Invalid staging-dir prefix {prefix!r}: a prefix is a filename "
+            "fragment, not a path (no separators or NUL)"
+        )
+    for root in path:
+        base = os.path.expanduser(str(root.path if hasattr(root, "path") else root))
+        try:
+            # Confirm base is inside the pathsec sandbox before creating anything,
+            # so a surprising ~ / $HOME / NLTK_DATA expansion cannot make
+            # os.makedirs build a directory chain, or mkdtemp stage output,
+            # outside the allowed roots. validate_path resolves symlinks the same
+            # way the allowed roots are computed, so this never trusts more than
+            # the sandbox does.
+            _validate_path(base, context="nltk.data.make_staging_dir")
+            os.makedirs(base, exist_ok=True)
+            staged = tempfile.mkdtemp(prefix=prefix, dir=base)
+            try:
+                # Defence in depth: confirm what was actually created is inside
+                # the root just validated, not merely that the base was.
+                _validate_path(staged, context="nltk.data.make_staging_dir")
+            except BaseException:
+                os.rmdir(staged)
+                raise
+            if cleanup:
+                atexit.register(shutil.rmtree, staged, ignore_errors=True)
+            return staged
+        except (OSError, ValueError, PermissionError):
+            continue
+    raise PermissionError(
+        f"No writable in-sandbox NLTK data root to stage output in (tried "
+        f"{len(path)} nltk.data.path entries); pass an explicit destination "
+        "directory."
+    )
 
 
 def gzip_open_unicode(
