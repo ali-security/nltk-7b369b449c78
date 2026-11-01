@@ -21,6 +21,7 @@ except ImportError:
     pass
 
 from nltk.parse import DependencyEvaluator, DependencyGraph, ParserI
+from nltk.pathsec import open as pathsec_open
 from nltk.picklesec import allowlisted_pickle_load
 
 # Modules whose globals a saved TransitionParser model legitimately needs. The
@@ -33,9 +34,29 @@ from nltk.picklesec import allowlisted_pickle_load
 # denied-module backstop do the heavy lifting: a crafted pickle can no longer
 # reach ``numpy.f2py.crackfortran.myeval`` (an eval sink under the allowed
 # ``numpy`` namespace) or a dotted ``sklearn.os.system`` (GHSA-x99w / GHSA-4489).
-_MODEL_ALLOWED_MODULES = ("numpy", "scipy", "sklearn")
+#
+# Narrowed further to fail closed: no whole module is allowed
+# (``_MODEL_ALLOWED_MODULES = ()``); only the exact ``(module, qualname)`` pairs a
+# genuine fitted SVC pickle references are permitted (CWE-502).
+_MODEL_ALLOWED_MODULES = ()
 # Exact primitives a fitted model's containers may reference.
 _MODEL_ALLOWED_GLOBALS = (
+    ("sklearn.svm._classes", "SVC"),
+    ("numpy", "ndarray"),
+    ("numpy", "dtype"),
+    ("numpy.core.multiarray", "_reconstruct"),
+    ("numpy._core.multiarray", "_reconstruct"),
+    ("numpy.core.multiarray", "scalar"),
+    ("numpy._core.multiarray", "scalar"),
+    # numpy >= 2.5 pickles a contiguous array via _frombuffer (an in-memory
+    # buffer reshape, no file/code access), not _reconstruct.
+    ("numpy._core.numeric", "_frombuffer"),
+    ("numpy.core.numeric", "_frombuffer"),
+    ("scipy.sparse._csr", "csr_matrix"),
+    ("scipy.sparse.csr", "csr_matrix"),
+    ("scipy.sparse._csc", "csc_matrix"),
+    ("scipy.sparse.csc", "csc_matrix"),
+    # Exact primitives a fitted model's containers may reference.
     ("collections", "defaultdict"),
     ("collections", "OrderedDict"),
     ("builtins", "int"),
@@ -561,7 +582,12 @@ class TransitionParser(ParserI):
 
             model.fit(x_train, y_train)
             # Save the model to file name (as pickle)
-            pickle.dump(model, open(modelfile, "wb"))
+            #
+            # ``modelfile`` is a caller-supplied path, so route the write through
+            # the pathsec sandbox: an unauthorized destination is refused before
+            # any bytes are written (GHSA-8mgp-746c-j5xp).
+            with pathsec_open(modelfile, "wb", context="TransitionParser.train") as f:
+                pickle.dump(model, f)
         finally:
             remove(input_file.name)
 
@@ -580,7 +606,11 @@ class TransitionParser(ParserI):
         # e.g. os.system -- raises UnpicklingError instead of executing. See
         # nltk/picklesec.py and huntr report
         # https://huntr.com/bounties/38abc191-0525-42a1-96fd-262c1c187012
-        with open(modelFile, "rb") as f:
+        #
+        # ``modelFile`` is a caller-supplied path, so route the read through the
+        # pathsec sandbox too: an out-of-sandbox model path is refused before it
+        # is opened (GHSA-8mgp-746c-j5xp).
+        with pathsec_open(modelFile, "rb", context="TransitionParser.parse") as f:
             model = allowlisted_pickle_load(
                 f,
                 allowed_modules=_MODEL_ALLOWED_MODULES,
@@ -773,6 +803,10 @@ def demo():
     A. Check the ARC-STANDARD training
     >>> import tempfile
     >>> import os
+    >>> from nltk.data import make_staging_dir
+    >>> _model_dir = make_staging_dir(prefix='nltk_tp_demo_')
+    >>> std_model = os.path.join(_model_dir, 'temp.arcstd.model')
+    >>> eager_model = os.path.join(_model_dir, 'temp.arceager.model')
     >>> input_file = tempfile.NamedTemporaryFile(prefix='transition_parse.train', dir=tempfile.gettempdir(), delete=False)
 
     >>> parser_std = TransitionParser('arc-standard')
@@ -781,7 +815,7 @@ def demo():
      Number of valid (projective) examples : 1
     SHIFT, LEFTARC:ATT, SHIFT, LEFTARC:SBJ, SHIFT, SHIFT, LEFTARC:ATT, SHIFT, SHIFT, SHIFT, LEFTARC:ATT, RIGHTARC:PC, RIGHTARC:ATT, RIGHTARC:OBJ, SHIFT, RIGHTARC:PU, RIGHTARC:ROOT, SHIFT
 
-    >>> parser_std.train([gold_sent],'temp.arcstd.model', verbose=False)
+    >>> parser_std.train([gold_sent], std_model, verbose=False)
      Number of training examples : 1
      Number of valid (projective) examples : 1
     >>> input_file.close()
@@ -796,7 +830,7 @@ def demo():
      Number of valid (projective) examples : 1
     SHIFT, LEFTARC:ATT, SHIFT, LEFTARC:SBJ, RIGHTARC:ROOT, SHIFT, LEFTARC:ATT, RIGHTARC:OBJ, RIGHTARC:ATT, SHIFT, LEFTARC:ATT, RIGHTARC:PC, REDUCE, REDUCE, REDUCE, RIGHTARC:PU
 
-    >>> parser_eager.train([gold_sent],'temp.arceager.model', verbose=False)
+    >>> parser_eager.train([gold_sent], eager_model, verbose=False)
      Number of training examples : 1
      Number of valid (projective) examples : 1
 
@@ -807,20 +841,20 @@ def demo():
 
     A. Check the ARC-STANDARD parser
 
-    >>> result = parser_std.parse([gold_sent], 'temp.arcstd.model')
+    >>> result = parser_std.parse([gold_sent], std_model)
     >>> de = DependencyEvaluator(result, [gold_sent])
     >>> de.eval() >= (0, 0)
     True
 
     B. Check the ARC-EAGER parser
-    >>> result = parser_eager.parse([gold_sent], 'temp.arceager.model')
+    >>> result = parser_eager.parse([gold_sent], eager_model)
     >>> de = DependencyEvaluator(result, [gold_sent])
     >>> de.eval() >= (0, 0)
     True
 
     Remove test temporary files
-    >>> remove('temp.arceager.model')
-    >>> remove('temp.arcstd.model')
+    >>> remove(eager_model)
+    >>> remove(std_model)
 
     Note that result is very poor because of only one training example.
     """

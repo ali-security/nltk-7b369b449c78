@@ -114,6 +114,13 @@ _DENIED_MODULE_PREFIXES = (
     "numpy.ctypeslib",
     "numpy.distutils",
     "numpy.testing",
+    # numpy.lib file-I/O sinks (npyio/_npyio_impl recfromtxt etc., format.open_memmap)
+    # keep __module__ under numpy.lib, dodging the export-name denylist (CWE-502).
+    "numpy.lib",
+    # File-read/write and network sinks under scipy/sklearn (scipy.io.mmwrite,
+    # loadmat; sklearn.datasets.fetch_openml/load_*). No model pickle needs them.
+    "scipy.io",
+    "sklearn.datasets",
     "nltk.tokenize.repp",
     "nltk.internals",
 )
@@ -138,6 +145,15 @@ _DENIED_GLOBALS = frozenset(
         ("numpy", "memmap"),
         ("numpy", "DataSource"),
         ("numpy", "vectorize"),
+        # numpy callables that invoke a supplied function -- a REDUCE gadget can
+        # ride them to call another reconstructed callable.
+        ("numpy", "apply_along_axis"),
+        ("numpy", "apply_over_axes"),
+        ("numpy", "frompyfunc"),
+        ("numpy", "piecewise"),
+        # scipy low-level C callback wrapper.
+        ("scipy", "LowLevelCallable"),
+        ("scipy._lib._ccallback", "LowLevelCallable"),
         ("pandas", "read_pickle"),
     }
 )
